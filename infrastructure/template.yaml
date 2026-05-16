@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Infrastructure for the Insurance Claims Multi-Agent Processing System.
+  Deploys DynamoDB tables, IAM roles, and supporting resources.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-20250514
+    Description: Bedrock model ID for agent inference
+
+  FraudScoreThreshold:
+    Type: Number
+    Default: 0.7
+    Description: Fraud score threshold for SIU referral (0-1)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 900
+    MemorySize: 512
+    Environment:
+      Variables:
+        CLAIMS_MODEL_MODEL_ID: !Ref BedrockModelId
+        CLAIMS_MODEL_REGION: !Ref AWS::Region
+        CLAIMS_DYNAMO_CLAIMS_TABLE: !Ref ClaimsTable
+        CLAIMS_DYNAMO_POLICIES_TABLE: !Ref PoliciesTable
+        CLAIMS_DYNAMO_FRAUD_SIGNALS_TABLE: !Ref FraudSignalsTable
+        CLAIMS_DYNAMO_REGION: !Ref AWS::Region
+        CLAIMS_GUARDRAILS_FRAUD_SCORE_THRESHOLD: !Ref FraudScoreThreshold
+
+Resources:
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+
+  ClaimsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "insurance-claims-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      KeySchema:
+        - AttributeName: claim_id
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: claim_id
+          AttributeType: S
+        - AttributeName: policy_number
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: policy-number-index
+          KeySchema:
+            - AttributeName: policy_number
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - claim_id
+              - claimant_name
+              - claim_type
+              - estimated_amount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: insurance-claims-agent
+        - Key: DataClassification
+          Value: PII
+
+  PoliciesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "insurance-policies-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      KeySchema:
+        - AttributeName: policy_number
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: policy_number
+          AttributeType: S
+        - AttributeName: policyholder_name
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: policyholder-index
+          KeySchema:
+            - AttributeName: policyholder_name
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: insurance-claims-agent
+        - Key: DataClassification
+          Value: PII
+
+  FraudSignalsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "fraud-signals-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      KeySchema:
+        - AttributeName: claim_id
+          KeyType: HASH
+        - AttributeName: scored_at
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: claim_id
+          AttributeType: S
+        - AttributeName: scored_at
+          AttributeType: S
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: insurance-claims-agent
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+
+  ClaimsAgentExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "claims-agent-execution-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ClaimsTable.Arn
+                  - !Sub "${ClaimsTable.Arn}/index/*"
+                  - !GetAtt PoliciesTable.Arn
+                  - !Sub "${PoliciesTable.Arn}/index/*"
+                  - !GetAtt FraudSignalsTable.Arn
+        - PolicyName: BedrockInvokeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+        - PolicyName: XRayTracing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: InsuranceClaimsAgent
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: insurance-claims-agent
+
+  # ============================================================
+  # CloudWatch Alarms
+  # ============================================================
+
+  HighFraudRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "claims-high-fraud-rate-${Environment}"
+      AlarmDescription: >
+        Triggers when more than 20% of claims in a 1-hour window are flagged
+        as high fraud risk, indicating potential fraud ring activity.
+      Namespace: InsuranceClaimsAgent
+      MetricName: HighFraudScoreClaims
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ClaimsTableName:
+    Description: Name of the claims DynamoDB table
+    Value: !Ref ClaimsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-ClaimsTable"
+
+  ClaimsTableArn:
+    Description: ARN of the claims DynamoDB table
+    Value: !GetAtt ClaimsTable.Arn
+
+  PoliciesTableName:
+    Description: Name of the policies DynamoDB table
+    Value: !Ref PoliciesTable
+
+  AgentRoleArn:
+    Description: ARN of the agent execution IAM role
+    Value: !GetAtt ClaimsAgentExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AgentRoleArn"
